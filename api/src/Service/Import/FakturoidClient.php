@@ -36,6 +36,8 @@ final class FakturoidClient
     private const USER_AGENT = 'MyInvoice.cz Import (https://github.com/radekhulan/myinvoice; radek@hulan.cz)';
     private const TIMEOUT = 30;
     private const RATE_LIMIT_THRESHOLD = 180; // req/min
+    private const PAGE_SIZE = 40;   // Fakturoid v3 fixní velikost stránky (viz API docs)
+    private const MAX_PAGES = 10000; // pojistka proti nekonečné smyčce (~400k záznamů)
 
     private Client $http;
     /** @var array<int, list<int>>  supplier_id → list timestamps (rolling 60s) */
@@ -248,21 +250,50 @@ final class FakturoidClient
     }
 
     /**
-     * Generator přes všechny stránky.
+     * Generator přes VŠECHNY stránky dané kolekce.
+     *
+     * Fakturoid v3 stránkuje fixně po {@see self::PAGE_SIZE} záznamech přes `page`
+     * query param — to je jediný dokumentovaný pagination kontrakt. Hlavní stop-signál
+     * je proto PLNOST stránky: dokud server vrací plnou stránku (== PAGE_SIZE), ber dál.
+     *
+     * Link header (`rel="next"`) NENÍ v API docs uveden, takže ho bereme jen jako
+     * doplňkový signál. Dřív byl jediným kritériem (`next_page !== null`), což tiše
+     * uřízlo import po první stránce (40 položek), kdykoliv ho Fakturoid neposlal,
+     * poslal pod jiným casingem, nebo rozdělil do víc Link hlaviček.
      *
      * @return iterable<array<string,mixed>>
      */
     public function getAll(int $supplierId, string $endpoint, array $extraQuery = []): iterable
     {
         $page = 1;
-        do {
+        while (true) {
             $res = $this->get($supplierId, $endpoint, $page, $extraQuery);
+
+            $count = 0;
             foreach ($res['items'] as $item) {
+                $count++;
                 yield $item;
             }
-            $hasMore = $res['next_page'] !== null && !empty($res['items']);
+
+            // Neúplná stránka bez "next" odkazu = konec kolekce.
+            $pageWasFull = $count >= self::PAGE_SIZE;
+            if (!$pageWasFull && $res['next_page'] === null) {
+                break;
+            }
+            // Prázdná stránka → konec (i kdyby přišel zastaralý "next" odkaz).
+            if ($count === 0) {
+                break;
+            }
+            if ($page >= self::MAX_PAGES) {
+                $this->logger->warning('Fakturoid getAll: dosažen MAX_PAGES strop — import může být neúplný', [
+                    'supplier_id' => $supplierId,
+                    'endpoint'    => $endpoint,
+                    'max_pages'   => self::MAX_PAGES,
+                ]);
+                break;
+            }
             $page++;
-        } while ($hasMore);
+        }
     }
 
     /**
